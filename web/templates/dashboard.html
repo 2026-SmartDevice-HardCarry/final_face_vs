@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Smart Mirror</title>
+  <meta http-equiv="refresh" content="10">
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <style>
+    body { background-color: black !important; margin: 0; overflow: hidden; }
+  </style>
+
+  <div class="top">
+    <div class="title">Smart Mirror · {{ now }}</div>
+    <div class="badge mode">{{ policy.ui_mode }}</div>
+    <div class="badge cond">{{ cond.state }}</div>
+  </div>
+
+  {% if policy.ui_mode == "idle" %}
+    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 80vh;">
+      
+      <div style="text-align: center; margin-bottom: 40px;">
+        <div style="font-size: 36px; font-weight: 800; color: white; margin-bottom: 10px;">거울 앞에 서면 시작할게요 👋</div>
+        <div style="font-size: 18px; color: #aaa;">카메라로 얼굴을 감지 중…</div>
+      </div>
+
+      <div style="width: 800px; height: 450px; border: 2px solid #444; border-radius: 15px; overflow: hidden; background: #111; box-shadow: 0 0 50px rgba(255,255,255,0.1);">
+        <img src="{{ url_for('video_feed') }}" 
+             style="width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1);">
+      </div>
+
+    </div>
+  {% else %}
+    <div class="grid">
+      <!-- 1) 성공확률 -->
+      <div class="card">
+        <div class="card-title">외출 성공확률</div>
+        <div class="big">{{ (risk_now.p * 100)|round(0) }}%</div>
+        <div class="sub">5분 조기: {{ (risk_early.p * 100)|round(0) }}%</div>
+        <div class="sub">리스크: {{ ", ".join(risk_now.factors) if risk_now.factors else "낮음" }}</div>
+      </div>
+
+      <!-- 2) 날씨 -->
+      <div class="card">
+        <div class="card-title">날씨</div>
+        <div class="big">
+          {% if weather.temp is not none %}{{ weather.temp|round(0) }}°C{% else %}--{% endif %}
+        </div>
+        <div class="sub">체감 {{ weather.feels_like|round(0) if weather.feels_like is not none else "--" }}°C</div>
+        <div class="sub">강수확률 {{ (precip_prob*100)|round(0) }}%</div>
+      </div>
+
+      <!-- 3) 버스 -->
+      <div class="card">
+        <div class="card-title">버스(근처 정류장)</div>
+        {% if stop %}
+          <div class="big">{{ eta_min if eta_min is not none else "--" }}분</div>
+          <div class="sub">{{ stop.nodeNm }}</div>
+          <div class="sub">cityCode: {{ city_code if city_code else "미설정(설정 필요)" }}</div>
+          <div class="list">
+            {% for a in arrivals_preview %}
+              <div class="row">
+                <div class="left">{{ a.routeNo }}</div>
+                <div class="right">{{ a.arrTimeMin if a.arrTimeMin is not none else "--" }}분</div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="big">--</div>
+          <div class="sub">근처 정류장 탐색 실패</div>
+        {% endif %}
+      </div>
+
+      <!-- 4) 체크리스트 -->
+      <div class="card">
+        <div class="card-title">소지품 체크 순서</div>
+        <div class="mid">{{ " → ".join(checklist_order) }}</div>
+        <div class="sub">리스크: {{ "/".join(checklist_risks) if checklist_risks else "없음" }}</div>
+        <button class="btn" onclick="sendInteraction()">확인(터치)</button>
+      </div>
+
+      <!-- 5) 컨디션 -->
+      <div class="card">
+        <div class="card-title">컨디션(Edge CV)</div>
+        <div class="mid">state: {{ cond.state }}</div>
+        <div class="sub">blink/min: {{ cond.blink_per_min }}</div>
+        <div class="sub">closed_ratio(10s): {{ cond.closed_ratio_10s }}</div>
+        <div class="sub">head_motion_std: {{ cond.head_motion_std }}</div>
+      </div>
+
+      <!-- 6) 브리핑 -->
+      <div class="card">
+        <div class="card-title">오늘의 브리핑</div>
+        <div class="sub">{{ briefing.summary }}</div>
+        <ul>
+          {% for p in briefing.action_points %}
+            <li class="li">{{ p }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endif %}
+</body>
+</html>
