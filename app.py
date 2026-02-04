@@ -19,6 +19,20 @@ from logic.policy import apply_policy
 from logic.briefing import make_briefing
 
 app = Flask(__name__, template_folder="web/templates", static_folder="web/static")
+# 라즈베리파이에서 보낸 프레임을 담을 전역 변수
+latest_frame = None 
+
+@app.route('/upload_frame', methods=['POST'])
+def upload_frame():
+    global latest_frame
+    try:
+        # 라즈베리파이가 보낸 바이트 데이터를 이미지로 변환
+        img_byte = request.data
+        nparr = np.frombuffer(img_byte, np.uint8)
+        latest_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return "OK", 200
+    except Exception as e:
+        return str(e), 500
 init_db()
 
 tz = pytz.timezone(Config.TZ)
@@ -49,48 +63,16 @@ def parse_hhmm(s: str) -> int:
     return int(hh)*60 + int(mm)
 
 # ====== CV 스레드 (카메라 독점 사용 및 프레임 공유) ======
+# app.py의 cv_loop 예시
 def cv_loop():
     global latest_frame
-    # 여기서만 카메라를 딱 한 번 엽니다.
-    est = ConditionEstimatorCV(
-        cam_index=Config.CAM_INDEX,
-        width=Config.CAM_WIDTH,
-        height=Config.CAM_HEIGHT,
-        fps_hint=15
-    )
-    
-    last_logged = None
+    est = ConditionEstimatorCV() # 이제 파라미터가 필요 없습니다.
     
     while True:
-        # 1. AI 분석 수행
-        st = est.step()
+        # 전역 변수에 저장된 프레임을 분석기로 전달합니다.
+        st = est.step(external_frame=latest_frame) 
         
-        # 2. 분석된 영상 프레임 가져오기 (이 기능이 ConditionEstimatorCV에 있어야 함)
-        # 만약 est.step()이 프레임을 반환하지 않는다면 아래와 같이 est 내부 cap에 접근 시도
-        if hasattr(est, 'cap'):
-            success, frame = est.cap.read()
-            if success:
-                latest_frame = frame # 최신 프레임을 전역 변수에 저장
-        
-        with cv_lock:
-            cv_state.update({
-                "state": st.state,
-                "face_detected": st.face_detected,
-                "blink_per_min": st.blink_per_min,
-                "closed_ratio_10s": st.closed_ratio_10s,
-                "head_motion_std": st.head_motion_std,
-                "last_update_ts": st.last_update_ts
-            })
-
-        if last_logged != st.state:
-            log_event(iso_now(), "condition_detected", json.dumps({
-                "condition_state": st.state,
-                "blink_per_min": st.blink_per_min,
-                "closed_ratio_10s": st.closed_ratio_10s,
-                "head_motion_std": st.head_motion_std
-            }, ensure_ascii=False))
-            last_logged = st.state
-
+        # ... (이후 결과 업데이트 로직) ...
         time.sleep(0.05)
 
 threading.Thread(target=cv_loop, daemon=True).start()
