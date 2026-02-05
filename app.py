@@ -1,38 +1,19 @@
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, session
 from datetime import datetime
-import json
 import threading
 import time
 import pytz
 import cv2
+import numpy as np
 
 from config import Config
-from db import init_db, get_stat, set_stat, log_event
-from services.openweather import get_openweather
-from services.tago import get_nearby_stops, get_arrivals_by_stop
+from db import init_db, log_event
 from cv.condition_cv import ConditionEstimatorCV
-
-from logic.ai_commute import success_prob
-from logic.ai_behavior import laplace_prob, risk_level
-from logic.ai_checklist import order_checklist
+# policy 모듈은 ui_mode 결정을 위해 유지하거나, 필요 없다면 제거 가능합니다.
 from logic.policy import apply_policy
-from logic.briefing import make_briefing
 
 app = Flask(__name__, template_folder="web/templates", static_folder="web/static")
-# 라즈베리파이에서 보낸 프레임을 담을 전역 변수
-latest_frame = None 
-
-@app.route('/upload_frame', methods=['POST'])
-def upload_frame():
-    global latest_frame
-    try:
-        # 라즈베리파이가 보낸 바이트 데이터를 이미지로 변환
-        img_byte = request.data
-        nparr = np.frombuffer(img_byte, np.uint8)
-        latest_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        return "OK", 200
-    except Exception as e:
-        return str(e), 500
+app.secret_key = "mirror_secret_key_1234"
 init_db()
 
 tz = pytz.timezone(Config.TZ)
@@ -47,139 +28,80 @@ cv_state = {
     "head_motion_std": 0.0,
     "last_update_ts": 0.0
 }
-
-# 실시간 영상을 공유하기 위한 전역 변수
 latest_frame = None 
 
-def iso_now():
-    return datetime.now(tz).isoformat(timespec="seconds")
+# 라즈베리파이로부터 영상을 받는 입구
+@app.route('/upload_frame', methods=['POST'])
+def upload_frame():
+    global latest_frame
+    try:
+        # 헤더에서 사용자 ID 추출 및 세션 저장
+        user_id = request.headers.get('User-ID', 'Unknown')
+        if user_id != "Unknown":
+            session['user_id'] = user_id
 
-def safe_int(s: str, default=0):
-    try: return int(s)
-    except: return default
+        img_byte = request.data
+        nparr = np.frombuffer(img_byte, np.uint8)
+        latest_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return "OK", 200
+    except Exception as e:
+        return str(e), 500
 
-def parse_hhmm(s: str) -> int:
-    hh, mm = s.split(":")
-    return int(hh)*60 + int(mm)
-
-# ====== CV 스레드 (카메라 독점 사용 및 프레임 공유) ======
-# app.py의 cv_loop 예시
+# ====== CV 스레드 (피로도 분석) ======
 def cv_loop():
     global latest_frame
-    est = ConditionEstimatorCV() # 이제 파라미터가 필요 없습니다.
+    est = ConditionEstimatorCV() 
     
     while True:
-        # 전역 변수에 저장된 프레임을 분석기로 전달합니다.
+        # 전역 변수에 저장된 프레임을 분석기로 전달
         st = est.step(external_frame=latest_frame) 
         
-        # ... (이후 결과 업데이트 로직) ...
-        time.sleep(0.05)
+        with cv_lock:
+            cv_state.update({
+                "state": st.state,
+                "face_detected": st.face_detected,
+                "blink_per_min": st.blink_per_min,
+                "closed_ratio_10s": st.closed_ratio_10s,
+                "head_motion_std": st.head_motion_std,
+                "last_update_ts": st.last_update_ts
+            })
+        time.sleep(0.1)
 
 threading.Thread(target=cv_loop, daemon=True).start()
 
-# ====== 영상 송출 (공유된 프레임을 브라우저로 전송) ======
+# ====== 영상 송출 (브라우저 전송) ======
 @app.route('/video_feed')
 def video_feed():
     def generate():
         global latest_frame
         while True:
             if latest_frame is not None:
-                # 거울 반전
                 frame = cv2.flip(latest_frame, 1)
                 ret, buffer = cv2.imencode('.jpg', frame)
                 if ret:
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            time.sleep(0.1) # 전송 부하 감소
+            time.sleep(0.1)
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# ... (기존 api_interaction, api_nearby, api_arrivals 코드와 동일하므로 중략) ...
 
 @app.route("/")
 def dashboard():
+    current_user = session.get('user_id', 'Unknown')
     now = datetime.now(tz)
-    now_min = now.hour * 60 + now.minute
 
-    # 1. CV 상태 가져오기
     with cv_lock:
         cond = dict(cv_state)
 
-    # 2. 정책 적용 (UI 모드 결정)
+    # UI 모드 결정을 위한 최소한의 정책 적용
     policy = apply_policy(cond["state"])
 
-    # ---- 3. 날씨 정보 (터미널 로그 출력 기능 추가) ----
-    weather = get_openweather(Config.OWM_API_KEY, Config.HOME_LAT, Config.HOME_LON)
-    
-    # 터미널 출력용 로그
-    print("\n" + "☀️" + "-"*30)
-    if weather.get("ok"):
-        temp = weather.get("temp")
-        precip = float(weather.get("precip_prob", 0.0))
-        print(f" [날씨 수신 성공] 현재 온도: {temp}°C | 강수확률: {int(precip*100)}%")
-        precip_prob = precip
-    else:
-        print(f" [날씨 수신 실패] 에러: {weather.get('error')}")
-        precip_prob = 0.0
-    print("-" * 32 + "\n")
-
-    rain_like = precip_prob >= 0.5
-
-    # 4. 버스 정보 (TAGO)
-    eta_min = None
-    chosen_stop = None
-    arrivals_preview = []
-    city_code = Config.TAGO_CITY_CODE or ""
-    try:
-        near = get_nearby_stops(Config.TAGO_SERVICE_KEY, Config.BUS_STOP_LAT, Config.BUS_STOP_LON, num_rows=8)
-        if near.get("ok") and near["stops"]:
-            chosen_stop = near["stops"][0]
-            if city_code:
-                arr = get_arrivals_by_stop(Config.TAGO_SERVICE_KEY, city_code, chosen_stop["nodeId"], num_rows=20)
-                eta_min = arr.get("eta_min")
-                arrivals_preview = (arr.get("arrivals") or [])[:5]
-    except Exception: pass
-
-    # 5. 교통 및 성공 확률 계산
-    avg_depart = get_stat("avg_departure_hhmm", "08:10")
-    late_7 = safe_int(get_stat("late_count_7days", "0"), 0)
-    depart_delay = max(now_min - parse_hhmm(avg_depart), 0)
-    congestion = 0.5 if eta_min is None else min(max((eta_min - 5) / 15.0, 0.0), 1.0)
-    
-    risk_now = success_prob(congestion, late_7, depart_delay)
-    risk_early = success_prob(congestion, late_7, max(depart_delay - 5, 0))
-
-    # 6. 체크리스트 및 브리핑
-    base_items = ["차키", "지갑", "휴대폰", "우산"]
-    miss_freq = {k: safe_int(get_stat(f"miss_{k}", "0")) for k in ["car_key", "wallet", "phone", "umbrella"]}
-    # (주의: db key 이름이 miss_car_key 형태이므로 딕셔너리 키 매칭 확인 필요)
-    
-    checklist_order = order_checklist(base_items, {}, {"rain": rain_like}) # 간단화 버전
-    brief = make_briefing({
-        "success_prob_now": risk_now["p"],
-        "success_prob_early": risk_early["p"],
-        "recommend_depart_in_min": 5,
-        "precip_prob": precip_prob,
-        "eta_min": eta_min,
-        "checklist_risks": []
-    })
-
-    # 7. HTML로 데이터 전송
+    # [핵심] 피로도 데이터만 HTML로 전송 (날씨, 버스, 리스크 등 모두 제거)
     return render_template(
         "dashboard.html",
+        current_user=current_user,
         now=now.strftime("%Y-%m-%d %H:%M"),
         cond=cond,
-        policy=policy,
-        weather=weather if weather.get("ok") else {"temp": None, "feels_like": None, "precip_prob": 0.0},
-        precip_prob=precip_prob,
-        stop=chosen_stop,
-        city_code=city_code,
-        eta_min=eta_min,
-        arrivals_preview=arrivals_preview,
-        risk_now=risk_now,
-        risk_early=risk_early,
-        checklist_order=checklist_order,
-        checklist_risks=[],
-        briefing=brief
+        policy=policy
     )
 
 if __name__ == "__main__":
